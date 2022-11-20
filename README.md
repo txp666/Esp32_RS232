@@ -10,5 +10,5 @@
 
 ![](3.Images/1.jpg)
 
-
+4.LabView上位机用来接收BCD码并解析成对应的数据，需要将MQTTlib放入项目，包括数据解析子VI
 
