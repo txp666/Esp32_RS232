@@ -1,53 +1,102 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+// WiFi网络设置
+const char *ssid = "666";
+const char *password = "12345678";
+const char *mqtt_server="192.168.31.2";
+struct SensorData
+{
+  float torque;
+  float speed;
+  float power;
+};
 
-const char *ssid = "666";          // Enter your WiFi name
-const char *password = "12345678"; // Enter WiFi password
-const char *mqtt_broker = "192.168.31.110";
-const int mqtt_port = 1883;
-WiFiClient espClient;
-PubSubClient client(espClient);
+ float decodeFloat(unsigned char *data)
+ {
+   // 提取尾数
+   float mantissa = ((data[0] & 0xF0) >> 4) * 1000 + (data[0] & 0x0F) * 100 + ((data[1] & 0xF0) >> 4) * 10 + (data[1] & 0x0F);
+   mantissa += (((data[2] & 0xF0) >> 4) * 1000 + (data[2] & 0x0F) * 100 + ((data[3] & 0xF0) >> 4) * 10 + (data[3] & 0x0F)) * 0.0001;
+   mantissa = mantissa / 1000;
+   // 提取阶码
+   int8_t exponent = data[4] & 0x3F;
+ 
+   // 提取数字符号
+   if (data[4] & 0x80)
+   {
+     mantissa = -mantissa;
+   }
+ 
+   // 提取阶符
+   if (data[4] & 0x40)
+   {
+     exponent = -exponent;
+   }
+ 
+   // 计算浮点数
+   float result = mantissa * pow(10, exponent);
+ 
+   return result;
+ }
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+QueueHandle_t dataQueue;
+TaskHandle_t mqttTaskHandle;
+
+void mqttTask(void *pvParameters)
+{
+  while (true)
+  {
+    // 从队列中获取数据
+    SensorData data;
+    if (xQueueReceive(dataQueue, &data, portMAX_DELAY) != pdTRUE)
+      continue;
+
+    // 将数据发布到 MQTT 主题
+    char payload[64];
+    snprintf(payload, sizeof(payload), "{\"torque\":%.4f,\"speed\":%.4f,\"power\":%.4f}", data.torque, data.speed, data.power);
+    mqttClient.publish("motor", payload);
+  }
+}
 
 void setup()
 {
-
   Serial.begin(9600);
   Serial1.begin(19200);
 
-
-  // connecting to a WiFi network
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED)
   {
-    delay(500);
-    Serial.println("Connecting to WiFi..");
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
   }
+  Serial.println("Connected to WiFi");
 
-  Serial.println("Connected to the WiFi network");
-  // connecting to a mqtt broker
-  client.setServer(mqtt_broker, mqtt_port);
-  // client.setCallback(callback);
-  while (!client.connected())
+  mqttClient.setServer(mqtt_server, 1883);
+  while (!mqttClient.connected())
   {
-    Serial.println("Connecting to public emqx mqtt broker.....");
-    if (client.connect("esp8266-client"))
+    if (mqttClient.connect("esp32"))
     {
-      Serial.println("Public emqx mqtt broker connected");
+      Serial.println("Connected to MQTT server");
     }
     else
     {
-      Serial.print("failed with state ");
-      Serial.print(client.state());
-      delay(2000);
+      delay(1000);
+      Serial.println("Connecting to MQTT server...");
     }
   }
+
+  dataQueue = xQueueCreate(3, sizeof(SensorData));
+
+  xTaskCreatePinnedToCore(mqttTask, "mqttTask", 4096, NULL, 1, &mqttTaskHandle, 1);
 }
-unsigned char SendComd[1] = {0X20};
-unsigned char ReceiveDate[15] = {};
-char BCD_ReceiveDate[50];
+
 void loop()
 {
+  unsigned char SendComd[1] = {0X20};
+  unsigned char ReceiveDate[15] = {};
 
   Serial1.write(SendComd, 1);
   delay(20);
@@ -55,20 +104,17 @@ void loop()
   {
     Serial1.readBytes(ReceiveDate, 15);
   }
-  for (int i = 0; i < 15 * 2; i++)
-  {
-    BCD_ReceiveDate[i] = ((ReceiveDate[i >> 1] >> ((!(i & 1)) << 2)) & 0xf) + '0';
 
-    if (BCD_ReceiveDate[i] > '9')
-    {
-      BCD_ReceiveDate[i] = '0';
-    }
-  }
+  // 解码接收到的浮点数
+  float torque = decodeFloat(&ReceiveDate[0]);
+  float speed = decodeFloat(&ReceiveDate[5]);
+  float power = decodeFloat(&ReceiveDate[10]);
 
-  Serial.print("MyTorque: ");
-  Serial.println(BCD_ReceiveDate);
-  client.publish("motor", BCD_ReceiveDate, 15);
-  delay(100);
+  // 将数据存储到结构体中
+  SensorData data = {torque, speed, power};
 
-  client.loop();
+  // 将数据发送到队列
+  xQueueSend(dataQueue, &data, portMAX_DELAY);
+
+  delay(1000);
 }
